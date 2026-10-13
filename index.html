@@ -165,6 +165,29 @@
     #print-area{display:block;position:absolute;left:0;top:0;width:100%;}
     #print-area *{-webkit-print-color-adjust:exact;print-color-adjust:exact;}
     .no-print{display:none !important;}
+    html,body{background:#fff !important;color:#1A1A1A !important;}
+  }
+
+  /* ---- Tampilan HP / layar sempit (Android) ---- */
+  #mobile-topbar{display:none;}
+  #sidebar-backdrop{display:none;}
+  @media (max-width: 880px){
+    #mobile-topbar{
+      display:flex;position:fixed;top:0;left:0;right:0;z-index:120;height:52px;
+      align-items:center;gap:12px;padding:0 14px;background:var(--navy);color:#fff;
+    }
+    #mobile-topbar button{background:none;border:1px solid rgba(255,255,255,.3);color:#fff;
+      border-radius:6px;width:38px;height:36px;font-size:18px;line-height:1;}
+    #sidebar{
+      position:fixed !important;left:0;top:0;bottom:0;z-index:160;width:260px !important;max-width:84vw;
+      transform:translateX(-102%);transition:transform .22s ease;box-shadow:0 0 30px rgba(0,0,0,.4);
+    }
+    #sidebar.open{transform:translateX(0);}
+    #sidebar-backdrop.show{display:block;position:fixed;inset:0;z-index:150;background:rgba(0,0,0,.45);}
+    main{padding:68px 14px 28px !important;}
+    .modal-backdrop{padding:10px;}
+    .toast{left:14px;right:14px;bottom:14px;max-width:none;}
+    .modal-box [style*="grid-template-columns:1fr 1fr"]{grid-template-columns:1fr !important;}
   }
 
   .seal{
@@ -258,10 +281,13 @@ const APP_LOGO = document.getElementById('app-favicon').getAttribute('href');
 /* PENTING: samakan angka ini dengan field "version" di package.json setiap kali merilis
    pembaruan aplikasi desktop. Saat dibungkus dengan Electron (lihat main.js/preload.js),
    nilai ini otomatis disinkronkan dari package.json lewat window.desktopApp.getVersion(). */
-let APP_VERSION = '1.0.3';
-if(window.desktopApp && typeof window.desktopApp.getVersion === 'function'){
-  window.desktopApp.getVersion().then(v=>{ if(v) APP_VERSION = v; });
-}
+let APP_VERSION = '1.1.1';
+/* Promise yang selesai setelah versi aplikasi desktop terbaca. checkForUpdate() menunggunya,
+   supaya perbandingan dengan Firebase tidak memakai angka bawaan di atas sebelum versi
+   asli dari package.json sempat diterima (kondisi balapan). */
+const versionReady = (window.desktopApp && typeof window.desktopApp.getVersion === 'function')
+  ? window.desktopApp.getVersion().then(v=>{ if(v) APP_VERSION = v; }).catch(()=>{})
+  : Promise.resolve();
 /* Bandingkan dua nomor versi bergaya semver ("1.2.3"). True jika `remote` lebih baru dari `local`. */
 function isNewerVersion(remote, local){
   const r = String(remote).split('.').map(n=>parseInt(n,10)||0);
@@ -278,7 +304,7 @@ function isNewerVersion(remote, local){
    dirilis lewat fitur "Releases" GitHub). Repo boleh privat maupun publik — untuk repo
    privat, endpoint di bawah butuh token dan sebaiknya dipanggil lewat backend, bukan
    langsung dari browser. */
-const GITHUB_REPO = 'namaAkun/nama-repo';
+const GITHUB_REPO = 'siakadsdntanjung-glitch/RAPORT-SEMUA-JENJANG';
 
 /* Mengambil rilis TERBARU (bukan pre-release/draft) dari GitHub lewat REST API publiknya.
    Tidak butuh autentikasi untuk repo publik. Mengembalikan null bila gagal atau belum
@@ -293,7 +319,10 @@ async function fetchLatestGithubRelease(){
     const tag = String(data.tag_name||'').replace(/^v/i,'');
     // Utamakan aset pertama yang diunggah pada rilis (mis. installer .exe/.dmg/.AppImage).
     // Bila tidak ada aset yang dilampirkan, arahkan ke halaman rilis itu sendiri.
-    const asset = Array.isArray(data.assets) && data.assets.length ? data.assets[0] : null;
+    // Pilih berkas installer sungguhan (.exe/.dmg/.AppImage/.apk), BUKAN berkas pendamping seperti
+    // .blockmap atau latest.yml yang juga ikut diunggah electron-builder dan bisa muncul lebih dulu.
+    const daftarAset = Array.isArray(data.assets) ? data.assets : [];
+    const asset = daftarAset.find(a=>/\.(exe|dmg|appimage|apk)$/i.test(a.name||'')) || daftarAset[0] || null;
     return {
       version: tag || null,
       downloadUrl: asset ? asset.browser_download_url : data.html_url,
@@ -330,6 +359,7 @@ async function publikasikanVersiKeFirebase({ downloadUrl, latestVersion, minVers
 let versionGate = null; // diisi bila aplikasi harus diblokir
 async function checkForUpdate(){
   try{
+    await versionReady;
     const snap = await db.ref('config').once('value');
     const cfg = snap.val() || {};
     const fallbackUrl = `https://github.com/${GITHUB_REPO}/releases/latest`;
@@ -551,6 +581,8 @@ function switchActiveRole(role){
 /* Saat Admin Utama pertama dibuat, akun sudah masuk sebelum profilnya sempat ditulis.
    Flag ini menahan pemeriksaan peran supaya pengguna tidak langsung ditendang keluar. */
 let sedangMembuatAkunSendiri = false;
+/* Waktu percobaan login terakhir — dipakai handleAuthUser agar tidak menampilkan pesan ganda. */
+let ultimaLoginAttempt = 0;
 async function handleAuthUser(fbUser){
   if(sedangMembuatAkunSendiri) return;
   if(fbUser){
@@ -560,6 +592,15 @@ async function handleAuthUser(fbUser){
       const availableRoles = profile ? Object.keys(profile.roles||{}).filter(r=>profile.roles[r]) : [];
       if(!profile || availableRoles.length===0){
         toast('Akun tidak memiliki profil data/peran. Hubungi admin.', 'err');
+        await auth.signOut();
+        state.user = null;
+      } else if(['pending','nonaktif','ditolak'].includes(profile.status)){
+        // Akun belum/tidak aktif tidak boleh masuk ke dashboard. Pesan jelasnya ditampilkan oleh
+        // doLogin(); di sini cukup keluarkan akun (dan beri pesan hanya jika ini pemulihan sesi lama,
+        // bukan percobaan login yang baru saja dilakukan).
+        if(Date.now() - ultimaLoginAttempt > 8000){
+          toast(profile.status==='pending' ? 'Akun Anda masih menunggu aktivasi oleh Admin Utama.' : 'Akun Anda tidak aktif. Silakan hubungi Admin Utama.', 'err');
+        }
         await auth.signOut();
         state.user = null;
       } else {
@@ -577,6 +618,9 @@ async function handleAuthUser(fbUser){
     } catch(e){
       console.error(e);
       toast('Gagal memuat data pengguna.', 'err');
+      // Jangan biarkan akun tetap masuk dalam keadaan setengah jadi (tanpa profil terbaca).
+      try{ await auth.signOut(); }catch(_){}
+      state.user = null;
     }
   } else {
     state.user = null;
@@ -588,6 +632,7 @@ async function handleAuthUser(fbUser){
 auth.onAuthStateChanged(handleAuthUser);
 
 async function doLogin(email, password, expectedRole){
+  ultimaLoginAttempt = Date.now();
   try{
     const cred = await auth.signInWithEmailAndPassword(email, password);
     const snap = await db.ref('users/'+cred.user.uid).once('value');
@@ -1018,7 +1063,9 @@ function renderRegisterSekolahModal(){
     const npsn = el('rg-npsn').value.trim();
     const alamatSekolah = el('rg-alamat').value.trim();
     const namaAdmin = el('rg-nama').value.trim();
-    const email = el('rg-email').value.trim();
+    // Email diseragamkan ke huruf kecil: aturan database membandingkan email profil dengan email
+    // akun login (yang selalu huruf kecil), jadi "Budi@Gmail.com" akan ditolak bila tidak diseragamkan.
+    const email = el('rg-email').value.trim().toLowerCase();
     const pass = el('rg-pass').value;
     if(!namaSekolah || !namaAdmin || !email || pass.length<6){
       toast('Lengkapi data sekolah dan admin, kata sandi min 6 karakter.', 'err'); return;
@@ -1156,6 +1203,11 @@ function renderDashboardShell(){
   const otherRoles = Object.keys(state.user.roles||{}).filter(r=>state.user.roles[r] && r!==role);
 
   $app().innerHTML = `
+  <div id="mobile-topbar" class="no-print">
+    <button id="menu-toggle" aria-label="Buka menu">&#9776;</button>
+    <span style="font-family:'Fraunces',serif;font-size:15px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">Rapor Digital</span>
+  </div>
+  <div id="sidebar-backdrop" class="no-print"></div>
   <div style="height:100vh;display:flex;background:var(--bg);overflow:hidden;">
     <aside class="no-print" style="width:250px;background:var(--navy);flex-shrink:0;display:flex;flex-direction:column;padding:22px 14px;height:100vh;overflow-y:auto;" id="sidebar">
       <div style="display:flex;align-items:center;gap:10px;padding:6px 10px 22px;">
@@ -1198,6 +1250,13 @@ function renderDashboardShell(){
     n.addEventListener('click', ()=>{ state.tab = n.dataset.tab; renderDashboardShell(); });
   });
   el('logout-btn').addEventListener('click', doLogout);
+  // Menu geser (drawer) untuk layar sempit: tombol ☰ membuka, latar gelap menutup.
+  const toggleSidebar = (open)=>{
+    el('sidebar').classList.toggle('open', open);
+    el('sidebar-backdrop').classList.toggle('show', open);
+  };
+  el('menu-toggle').addEventListener('click', ()=> toggleSidebar(!el('sidebar').classList.contains('open')));
+  el('sidebar-backdrop').addEventListener('click', ()=> toggleSidebar(false));
   document.querySelectorAll('.switch-role-btn').forEach(b=>b.addEventListener('click', ()=>switchActiveRole(b.dataset.role)));
 
   const target = el('main-content');
@@ -1766,9 +1825,12 @@ async function renderASKelas(target, sid){
   // pengguna lain. Di sini (sesi Admin Sekolah, yang pasti punya izin) nama & NIP wali kelas
   // disalin langsung ke data kelas jika belum ada, agar rapor siswa tidak lagi kosong.
   Object.entries(kelas).forEach(([id,k])=>{
-    if(k.waliKelasUid && !k.waliKelasNama){
-      const w = users[k.waliKelasUid];
-      if(w && w.nama){
+    // Juga dijalankan bila NIP/nama di data kelas berbeda dari profil wali kelas (mis. NIP baru
+    // diisi atau diubah SETELAH kelas dibuat) — sebelumnya hanya dicek saat nama masih kosong,
+    // sehingga NIP yang menyusul tidak pernah tersalin ke rapor.
+    const w = k.waliKelasUid ? users[k.waliKelasUid] : null;
+    if(w && w.nama && (!k.waliKelasNama || (w.nip||null) !== (k.waliKelasNip||null) || w.nama !== k.waliKelasNama)){
+      {
         db.ref('kelas/'+sid+'/'+id).update({ waliKelasNama: w.nama, waliKelasNip: w.nip||null })
           .catch(e=>console.error('Gagal backfill wali kelas:', e));
       }
@@ -1981,7 +2043,18 @@ async function renderASGuru(target, sid){
       const isWali = el('f-iswali').checked;
       const nip = el('f-nip').value.trim();
       if(isEdit){
-        const ok = await simpanAman(()=> db.ref('users/'+id).update({ roles: { guru:true, wali_kelas: isWali }, nip }), 'Data guru diperbarui.');
+        const ok = await simpanAman(async ()=>{
+          await db.ref('users/'+id).update({ roles: { guru:true, wali_kelas: isWali }, nip });
+          // Salin NIP terbaru ke semua kelas yang diwalikan guru ini, karena rapor siswa
+          // membaca NIP dari data kelas (siswa tidak boleh membaca profil guru).
+          const kSnap = await db.ref('kelas/'+sid).once('value');
+          const semuaKelas = kSnap.val() || {};
+          for(const [kid,k] of Object.entries(semuaKelas)){
+            if(sameId(k.waliKelasUid, id)){
+              await db.ref('kelas/'+sid+'/'+kid).update({ waliKelasNama: data.nama || k.waliKelasNama || null, waliKelasNip: nip || null });
+            }
+          }
+        }, 'Data guru diperbarui.');
         if(!ok) return;
         closeModal(); renderASGuru(el('main-content'), sid);
         return;
@@ -2376,7 +2449,7 @@ async function renderGuru(target, tab){
         <div style="padding:22px 24px;">
           <h3 style="font-size:16px;margin:0 0 4px;">Capaian Pembelajaran</h3>
           <p style="font-size:13px;color:var(--text-soft);margin:0 0 12px;">${escHtml(mapel[mid]?.nama||'')} — Semester ${semester}. Tulis kompetensi yang dicapai (tanpa nama siswa dan tanpa kata "sangat mampu/mampu" — itu ditambahkan otomatis). Rapor tiap siswa akan berbunyi: <em>"[nama], [kualifikasi] [teks di bawah]."</em></p>
-          <textarea id="f-cp" class="box-input" rows="4" style="resize:vertical;line-height:1.5;" placeholder="Contoh: menganalisis siklus hidup makhluk hidup dan upaya pelestariannya">${escHtml(capaianTeks)}</textarea>
+          <textarea id="f-cp" class="box-input" rows="4" maxlength="500" style="resize:vertical;line-height:1.5;" placeholder="Contoh: menganalisis siklus hidup makhluk hidup dan upaya pelestariannya">${escHtml(capaianTeks)}</textarea>
           <div style="font-size:12px;color:var(--text-soft);margin-top:10px;line-height:1.7;">Kualifikasi otomatis berdasarkan nilai akhir:<br>${CAPAIAN_KUALIFIKASI.map(k=>`${k.min}${k.max<100?'–'+k.max:' ke atas'} → <strong>${escHtml(k.label)}</strong> ("${escHtml(k.frasa)}")`).join('<br>')}</div>
           <div class="modal-footer-sticky">
             <button class="btn btn-outline btn-sm" onclick="closeModal()">Batal</button>
@@ -2437,10 +2510,10 @@ function openCatatanRaporModal({sid, kelasId, semester, studentUid, studentNama,
     <div style="padding:26px;">
       <h3 style="margin:0 0 16px;font-size:17px;">Catatan Rapor — ${escHtml(studentNama||'')}</h3>
       <div style="display:flex;flex-direction:column;gap:12px;">
-        <textarea id="f-catatan" class="box-input" rows="3" placeholder="Catatan wali kelas">${escHtml(r.catatanWaliKelas||'')}</textarea>
+        <textarea id="f-catatan" class="box-input" rows="3" maxlength="1000" placeholder="Catatan wali kelas">${escHtml(r.catatanWaliKelas||'')}</textarea>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
-          <input id="f-spiritual" class="box-input" placeholder="Sikap Spiritual" value="${escHtml(r.sikap?.spiritual||'')}">
-          <input id="f-sosial" class="box-input" placeholder="Sikap Sosial" value="${escHtml(r.sikap?.sosial||'')}">
+          <input id="f-spiritual" class="box-input" maxlength="500" placeholder="Sikap Spiritual" value="${escHtml(r.sikap?.spiritual||'')}">
+          <input id="f-sosial" class="box-input" maxlength="500" placeholder="Sikap Sosial" value="${escHtml(r.sikap?.sosial||'')}">
         </div>
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;">
           <input id="f-sakit" type="number" class="box-input" placeholder="Sakit (hari)" value="${r.kehadiran?.sakit??''}">
@@ -2453,7 +2526,7 @@ function openCatatanRaporModal({sid, kelasId, semester, studentUid, studentNama,
           <button type="button" id="add-ekskul" class="btn btn-outline btn-sm" style="margin-top:8px;">${iconPlus()} Tambah Ekstrakurikuler</button>
         </div>
         ${semester==='2'? `<input id="f-keputusan" class="box-input" placeholder="Keputusan (mis. Naik ke Kelas V / Tinggal di Kelas IV)" value="${escHtml(r.keputusan||'')}">` : ''}
-        <input id="f-tempattgl" class="box-input" placeholder="Tempat, tanggal rapor dicetak" value="${escHtml(r.tempatTanggal||defaultTempatTanggal())}">
+        <input id="f-tempattgl" class="box-input" maxlength="120" placeholder="Tempat, tanggal rapor dicetak" value="${escHtml(r.tempatTanggal||defaultTempatTanggal())}">
       </div>
       <div style="display:flex;gap:8px;justify-content:space-between;margin-top:18px;">
         <button class="btn btn-outline btn-sm" id="finalize-btn">${iconLock()} ${r.finalized?'Buka Kunci':'Kunci Rapor'}</button>
@@ -2540,7 +2613,8 @@ async function renderWaliKelas(target, tab){
   // Jaring pengaman: jika data kelas ini belum punya nama wali kelas tersalin (kelas lama),
   // lengkapi diam-diam memakai data akun sendiri, agar rapor siswa tidak lagi kosong walau
   // Admin Sekolah belum sempat membuka halaman Data Kelas untuk memicu backfill di sana.
-  if(sameId(kelasInfo.waliKelasUid, state.user.uid) && !kelasInfo.waliKelasNama && state.user.nama){
+  if(sameId(kelasInfo.waliKelasUid, state.user.uid) && state.user.nama &&
+     (!kelasInfo.waliKelasNama || ((state.user.nip||null) !== (kelasInfo.waliKelasNip||null)))){
     db.ref('kelas/'+sid+'/'+kelasId).update({ waliKelasNama: state.user.nama, waliKelasNip: state.user.nip||null })
       .then(()=>{ kelasInfo.waliKelasNama = state.user.nama; kelasInfo.waliKelasNip = state.user.nip||null; })
       .catch(e=>console.error('Gagal melengkapi data wali kelas:', e));
@@ -2889,7 +2963,7 @@ async function renderRiwayatKelasSiswa(target, sid, uid, opts){
             <option value="1">Semester 1</option>
             <option value="2">Semester 2</option>
           </select>
-          <textarea id="f-notif-pesan" class="box-input" rows="4" placeholder="Jelaskan bagian data rapor yang perlu diperbaiki..."></textarea>
+          <textarea id="f-notif-pesan" class="box-input" rows="4" maxlength="1000" placeholder="Jelaskan bagian data rapor yang perlu diperbaiki..."></textarea>
         </div>
         <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:18px;">
           <button class="btn btn-outline btn-sm" onclick="closeModal()">Batal</button>
@@ -2977,20 +3051,28 @@ async function renderNotifikasiWaliKelas(target){
 
 /* ===================== PRINT RAPOR ===================== */
 async function printRapor(sid, kelasId, semester, siswaUid){
-  let uSnap, mSnap, nAllSnap, cAllSnap, rSnap, kSnap, waliSnap;
+  let uSnap, mSnap, cAllSnap, rSnap, kSnap, waliSnap;
+  const nAll = {};
   try{
-    [uSnap, mSnap, nAllSnap, rSnap, kSnap] = await Promise.all([
+    [uSnap, mSnap, rSnap, kSnap] = await Promise.all([
       db.ref('users/'+siswaUid).once('value'), db.ref('mapel/'+sid).once('value'),
-      db.ref(`nilai/${sid}/${kelasId}`).once('value'),
       db.ref(`rapor/${sid}/${kelasId}/${semester}/${siswaUid}`).once('value'),
       db.ref('kelas/'+sid+'/'+kelasId).once('value')
     ]);
+    // Nilai dibaca per mata pelajaran, HANYA untuk siswa ini (bukan seluruh nilai kelas), supaya
+    // sesuai aturan keamanan: siswa hanya boleh membaca nilainya sendiri, dan tidak ada data
+    // teman sekelas yang ikut terunduh ke perangkat.
+    const midList = Object.keys(mSnap.val()||{});
+    await Promise.all(midList.map(async mid=>{
+      const v = (await db.ref(`nilai/${sid}/${kelasId}/${mid}/${semester}/${siswaUid}`).once('value')).val();
+      nAll[mid] = { [semester]: { [siswaUid]: v || {} } };
+    }));
   }catch(e){
     console.error(e);
     toast(describeDbError(e), 'err');
     return;
   }
-  const siswa = uSnap.val()||{}, mapel = mSnap.val()||{}, nAll = nAllSnap.val()||{}, rapor = rSnap.val()||{}, kelasInfo = kSnap.val()||{};
+  const siswa = uSnap.val()||{}, mapel = mSnap.val()||{}, rapor = rSnap.val()||{}, kelasInfo = kSnap.val()||{};
   if(Object.keys(mapel).length === 0){
     toast('Data mata pelajaran belum tersedia, rapor belum dapat dicetak.', 'err');
     return;
@@ -3004,10 +3086,14 @@ async function printRapor(sid, kelasId, semester, siswaUid){
   // ini tetap tampil walau akun yang login (mis. siswa) tidak diizinkan membaca node "users" lain.
   // Pembacaan "users" di bawah hanya cadangan untuk data kelas lama yang belum disimpan ulang.
   let wali = { nama: kelasInfo.waliKelasNama || null, nip: kelasInfo.waliKelasNip || null };
-  // Percobaan baca "users" hanya masuk akal untuk peran yang mungkin diizinkan (bukan siswa) —
-  // akun siswa selalu ditolak aturan keamanan Firebase untuk node ini, jadi dilewati saja
-  // agar tidak memicu error permission_denied di konsol setiap kali siswa mencetak rapor.
-  if(kelasInfo.waliKelasUid && !wali.nama && state.user.activeRole !== 'siswa'){
+  // Cadangan: baca profil wali kelas dari "users" (aturan keamanan mengizinkan pengguna
+  // satu sekolah membaca profil di sekolahnya; bila ditolak, error hanya dicatat di konsol).
+  // Bila yang mencetak adalah wali kelas itu sendiri, pakai data akunnya langsung.
+  if(kelasInfo.waliKelasUid && sameId(kelasInfo.waliKelasUid, state.user.uid)){
+    wali.nama = wali.nama || state.user.nama || null;
+    wali.nip = wali.nip || state.user.nip || null;
+  }
+  if(kelasInfo.waliKelasUid && (!wali.nama || !wali.nip)){
     try{
       waliSnap = await db.ref('users/'+kelasInfo.waliKelasUid).once('value');
       const w2 = waliSnap.val()||{};
@@ -3111,22 +3197,27 @@ async function printRapor(sid, kelasId, semester, siswaUid){
         <p style="margin:4px 0 0;font-weight:700;">${escHtml(rapor.keputusan || '— belum ditetapkan —')}</p>
       </div>` : ''}
 
-      <table style="width:100%;margin-top:34px;">
-        <tr><td colspan="3" style="text-align:right;padding-bottom:26px;">${escHtml(tempatTanggal)}</td></tr>
+      <table style="width:100%;margin-top:34px;table-layout:fixed;border-collapse:collapse;">
+        <colgroup><col style="width:40%;"><col style="width:20%;"><col style="width:40%;"></colgroup>
         <tr>
-          <td style="width:34%;text-align:center;">Orang Tua/Wali</td>
-          <td style="width:32%;"></td>
-          <td style="width:34%;text-align:center;">Wali Kelas ${escHtml(kelasInfo.nama||'')}</td>
-        </tr>
-        <tr><td style="height:90px;"></td><td></td><td></td></tr>
-        <tr>
-          <td style="text-align:center;border-top:1px solid #1A1A1A;">&nbsp;</td>
-          <td></td>
-          <td style="text-align:center;font-weight:700;">${escHtml(wali.nama||'________________')}</td>
+          <td style="padding:0 0 26px;"></td><td style="padding:0 0 26px;"></td>
+          <td style="text-align:center;padding:0 0 26px;vertical-align:bottom;">${escHtml(tempatTanggal)}</td>
         </tr>
         <tr>
-          <td></td><td></td>
-          <td style="text-align:center;border-top:1px solid #1A1A1A;padding-top:2px;">${wali.nip? 'NIP. '+escHtml(wali.nip) : '&nbsp;'}</td>
+          <td style="text-align:center;padding:0;vertical-align:bottom;">Orang Tua/Wali</td>
+          <td style="padding:0;"></td>
+          <td style="text-align:center;padding:0;vertical-align:bottom;">Wali Kelas ${escHtml(kelasInfo.nama||'')}</td>
+        </tr>
+        <tr><td style="height:90px;padding:0;"></td><td style="padding:0;"></td><td style="padding:0;"></td></tr>
+        <tr>
+          <td style="text-align:center;padding:0;vertical-align:top;"><div style="display:inline-block;min-width:180px;border-bottom:1px solid #1A1A1A;font-weight:700;line-height:1.55;">&nbsp;</div></td>
+          <td style="padding:0;"></td>
+          <td style="text-align:center;padding:0;vertical-align:top;"><div style="display:inline-block;min-width:180px;border-bottom:1px solid #1A1A1A;font-weight:700;line-height:1.55;">${escHtml(wali.nama||'')}${wali.nama? '' : '&nbsp;'}</div></td>
+        </tr>
+        <tr>
+          <td style="text-align:center;padding:2px 0 0;vertical-align:top;line-height:1.55;">&nbsp;</td>
+          <td style="padding:0;"></td>
+          <td style="text-align:center;padding:2px 0 0;vertical-align:top;line-height:1.55;">${wali.nip? 'NIP. '+escHtml(wali.nip) : '&nbsp;'}</td>
         </tr>
       </table>
       <div style="text-align:center;margin-top:26px;">
